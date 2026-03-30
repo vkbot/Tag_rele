@@ -28,6 +28,7 @@ struct RelayData {
   int32_t lastMsgID;
   unsigned long lastAnyActivation; // ← новое поле
   unsigned long lastAnyDelta; // сколько мс прошло с последнего включения
+  unsigned long maintenanceInterval; // интервал профилактики в мс
 };
 
 WiFiData wifiData;
@@ -93,9 +94,10 @@ void saveRelayState() {
   relayData.lastOnTime = lastOnTime;
   relayData.lastAnyActivation = lastAnyActivation;
   relayData.lastAnyDelta = millis() - lastAnyActivation;
+  relayData.maintenanceInterval = CHECK_INTERVAL;
   EEPROM.put(sizeof(WiFiData), relayData);
   EEPROM.commit();
-  Serial.println("💾 EEPROM: relayState и lastAnyActivation сохранены");
+  Serial.println("💾 EEPROM: relayState/lastAnyActivation/CHECK_INTERVAL сохранены");
 }
 
 void saveMsgID() {
@@ -110,6 +112,12 @@ void loadRelayData() {
   EEPROM.get(sizeof(WiFiData), relayData);
   if (relayData.lastMsgID < 0 || relayData.lastMsgID > 100000000)
   relayData.lastMsgID = 0;
+
+  if (relayData.maintenanceInterval >= 10UL * 60UL * 1000UL &&
+      relayData.maintenanceInterval <= 1000UL * 60UL * 1000UL) {
+    CHECK_INTERVAL = relayData.maintenanceInterval;
+  }
+
   relayState = relayData.relayState;
   digitalWrite(RELAY_PIN, relayState ? LOW : HIGH);
   if (relayData.lastMsgID < 0) relayData.lastMsgID = 0;
@@ -320,6 +328,7 @@ else if (cmd.startsWith("/setmaint ")) {
     return;
   }
   CHECK_INTERVAL = minutes * 60UL * 1000UL;
+  saveRelayState();
   sendMsg("🔧 Профилактическое включение каждые " +
                   String(minutes) + " мин", TELEGRAM_CHAT_ID);
 }
