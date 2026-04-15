@@ -1,19 +1,28 @@
+#define FB_NO_URLENCODE  // 🔧 Отключаем встроенный кодер FastBot (используем свой)
+
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
 #include <FastBot.h>
 #include <ArduinoOTA.h>
+#include <ctype.h>
+#include <stdio.h>
 
 // ---------- Настройки ----------
-#define RELAY_PIN 0              // GPIO0
-#define EEPROM_SIZE 128
+#define RELAY_PIN 0
+#define EEPROM_SIZE 256  // Увеличили, чтобы вместить всё с запасом
 
-#define TELEGRAM_BOT_TOKEN "8041803190:AAHRkiEDfsomB1Kv7w4mxiFCOW9G_6yxA0I"
-#define TELEGRAM_CHAT_ID  "619084238"
+#define TOKEN "8041803190:AAHRkiEDfsomB1Kv7w4mxiFCOW9G_6yxA0I"
+const char* CHAT_ID   = "619084238";
+const char* WORKER    = "royal-river-71a9.dragonforceedge.workers.dev";
 #define DEFAULT_SSID     "Xiaomi_775D"
 #define DEFAULT_PASSWORD "135791113"
 ESP8266WebServer server(80);
-FastBot bot(TELEGRAM_BOT_TOKEN);
+FastBot bot(TOKEN);
+
+// 🔧 Глобальный клиент для отправки
+WiFiClientSecure tgClient;
+bool tgClientReady = false;  // Флаг инициализации
 
 // ---------- Структуры EEPROM ----------
 struct WiFiData {
@@ -26,63 +35,116 @@ struct RelayData {
   bool relayState;
   unsigned long lastOnTime;
   int32_t lastMsgID;
-  unsigned long lastAnyActivation; // ← новое поле
-  unsigned long lastAnyDelta; // сколько мс прошло с последнего включения
-  unsigned long maintenanceInterval; // интервал профилактики в мс
 };
 
 WiFiData wifiData;
 RelayData relayData;
 
-bool emergencyLockout = false;          // активна ли аварийная блокировка
-bool maintenanceMode = false;
-unsigned long lockoutStartTime = 0;     // когда началась блокировка (0 = не активна)
-const unsigned long LOCKOUT_DURATION = 3600 * 1000UL; // 1 час в миллисекундах
+bool emergencyLockout = false;
+unsigned long lockoutStartTime = 0;
+const unsigned long LOCKOUT_DURATION = 3600 * 1000UL;
 bool relayState = false;
 unsigned long lastOnTime = 0;
-unsigned long lastAnyActivation = 0; // время последнего включения реле (любым способом)
-unsigned long CHECK_INTERVAL = 2000 * 1000UL; // 33.3 минуты
-const unsigned long MAINTENANCE_DURATION = 3 * 60 * 1000UL; // 3 минуты
 const unsigned long AUTO_OFF_TIME = 900 * 1000UL;
 
 unsigned long lastEepromWrite = 0;
-const unsigned long EEPROM_WRITE_INTERVAL = 300000;
+const unsigned long EEPROM_WRITE_INTERVAL = 30000; // 30 сек
 
 String currentSSID;
 String currentPASS;
 
-String urlencode(const String& str) {
-  String encoded = "";
-  const char *cstr = str.c_str();
-
-  for (size_t i = 0; i < strlen(cstr); i++) {
-    unsigned char c = cstr[i];
-    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-        c == '-' || c == '_' || c == '.' || c == '~') {
-      encoded += (char)c;
-    } else {
-      char buf[4];
-      sprintf(buf, "%%%02X", c);
-      encoded += buf;
+// 🔧 UTF-8 → %XX
+String urlEncodeUTF8(const String& text) {
+    String enc; enc.reserve(text.length() * 3);
+    char buf[4];
+    for (size_t i = 0; i < text.length(); i++) {
+        char c = text[i];
+        if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') enc += c;
+        else { sprintf(buf, "%%%02X", (uint8_t)c); enc += buf; }
     }
-  }
-  return encoded;
+    return enc;
 }
 
-void sendMsg(String text, String chatId) {
-  bot.sendMessage(urlencode(text), chatId);
+// 📦 sendTG через POST (надёжно для длинных сообщений)
+bool sendTG(const String& msg, const String& chatId = "") {
+    String targetChat = chatId.length() ? chatId : CHAT_ID;
+    
+    if (!tgClientReady) {
+        tgClient.setInsecure();
+        tgClient.setTimeout(10000);
+        tgClient.setBufferSizes(2048, 2048);  // 🔥 ДОБАВЛЕНО: буферы для SSL
+        tgClientReady = true;
+    }
+    if (tgClient.connected()) tgClient.stop();
+
+    if (!tgClient.connect(WORKER, 443)) {
+        delay(200);
+        if (!tgClient.connect(WORKER, 443)) return false;
+    }
+
+    // POST-запрос
+    String body = "chat_id=" + targetChat + "&text=" + urlEncodeUTF8(msg);
+    String path = "/bot" + String(TOKEN) + "/sendMessage";
+
+    tgClient.print("POST " + path + " HTTP/1.1\r\n");
+    tgClient.print("Host: " + String(WORKER) + "\r\n");
+    tgClient.print("Content-Type: application/x-www-form-urlencoded\r\n");
+    tgClient.print("Content-Length: " + String(body.length()) + "\r\n");
+    tgClient.print("Connection: close\r\n\r\n");
+    tgClient.print(body);
+    tgClient.flush();
+    
+    delay(100); // Пауза для переключения SSL-стека
+    yield();
+
+    // Читаем ответ
+    String response;
+    response.reserve(2048);
+    unsigned long lastByte = millis();
+    unsigned long start = millis();
+    
+    while (!tgClient.available() && millis() - start < 5000) {
+        delay(10); yield();
+    }
+    
+    while (millis() - lastByte < 2000 && millis() - start < 12000) {
+        while (tgClient.available()) {
+            char c = tgClient.read();
+            response += c;
+            lastByte = millis();
+            if (response.length() >= 2000) goto parse_response;
+        }
+        delay(10); yield();
+    }
+    
+parse_response:
+    tgClient.stop();
+    delay(50);
+
+    return response.indexOf("\"ok\":true") >= 0;
 }
+
+void sendMsg(const String& text, const String& chatId) {
+    sendTG(text, chatId);
+}
+
 // ---------- EEPROM ----------
 void saveWiFiData(const char* s, const char* p) {
-  strncpy(wifiData.ssid, s, sizeof(wifiData.ssid));
-  strncpy(wifiData.pass, p, sizeof(wifiData.pass));
+  strncpy(wifiData.ssid, s, sizeof(wifiData.ssid) - 1);
+  strncpy(wifiData.pass, p, sizeof(wifiData.pass) - 1);
+  wifiData.ssid[31] = '\0';
+  wifiData.pass[31] = '\0';
   wifiData.flag = 1;
+  EEPROM.begin(EEPROM_SIZE);
   EEPROM.put(0, wifiData);
   EEPROM.commit();
+  EEPROM.end();
 }
 
 bool loadWiFiData(String &s, String &p) {
+  EEPROM.begin(EEPROM_SIZE);
   EEPROM.get(0, wifiData);
+  EEPROM.end();
   if (wifiData.flag != 1) return false;
   s = String(wifiData.ssid);
   p = String(wifiData.pass);
@@ -92,87 +154,75 @@ bool loadWiFiData(String &s, String &p) {
 void saveRelayState() {
   relayData.relayState = relayState;
   relayData.lastOnTime = lastOnTime;
-  relayData.lastAnyActivation = lastAnyActivation;
-  relayData.lastAnyDelta = millis() - lastAnyActivation;
-  relayData.maintenanceInterval = CHECK_INTERVAL;
+  EEPROM.begin(EEPROM_SIZE);
   EEPROM.put(sizeof(WiFiData), relayData);
   EEPROM.commit();
-  Serial.println("💾 EEPROM: relayState/lastAnyActivation/CHECK_INTERVAL сохранены");
+  EEPROM.end();
 }
 
 void saveMsgID() {
   if (millis() - lastEepromWrite < EEPROM_WRITE_INTERVAL) return;
-  EEPROM.put(sizeof(WiFiData), relayData);
+  EEPROM.begin(EEPROM_SIZE);
+  // Сохраняем ID по отдельному адресу, чтобы не затереть relayData
+  EEPROM.put(sizeof(WiFiData) + sizeof(RelayData), relayData.lastMsgID);
   EEPROM.commit();
+  EEPROM.end();
   lastEepromWrite = millis();
-  Serial.println("💾 EEPROM: lastMsgID сохранён");
 }
 
 void loadRelayData() {
+  EEPROM.begin(EEPROM_SIZE);
   EEPROM.get(sizeof(WiFiData), relayData);
-  if (relayData.lastMsgID < 0 || relayData.lastMsgID > 100000000)
-  relayData.lastMsgID = 0;
-
-  if (relayData.maintenanceInterval >= 10UL * 60UL * 1000UL &&
-      relayData.maintenanceInterval <= 1000UL * 60UL * 1000UL) {
-    CHECK_INTERVAL = relayData.maintenanceInterval;
-  }
-
+  // Загружаем lastMsgID из отдельной ячейки
+  int32_t savedID = 0;
+  EEPROM.get(sizeof(WiFiData) + sizeof(RelayData), savedID);
+  EEPROM.end();
+  
+  if (savedID > 0 && savedID < 100000000) relayData.lastMsgID = savedID;
+  else relayData.lastMsgID = 0;
+  
   relayState = relayData.relayState;
   digitalWrite(RELAY_PIN, relayState ? LOW : HIGH);
-  if (relayData.lastMsgID < 0) relayData.lastMsgID = 0;
   lastOnTime = relayState ? millis() : 0;
- lastAnyActivation = millis() - relayData.lastAnyDelta;
-  Serial.println("🔄 Данные загружены из EEPROM");
 }
+
 bool isEmergencyLocked() {
   if (!emergencyLockout) return false;
-  // Если прошёл час — снимаем блокировку автоматически
   if (millis() - lockoutStartTime >= LOCKOUT_DURATION) {
     emergencyLockout = false;
     lockoutStartTime = 0;
-    Serial.println("🔓 Аварийная блокировка снята автоматически (прошёл 1 час)");
   }
   return emergencyLockout;
 }
+
 // ---------- Реле ----------
-void switchRelay(bool state, String source = "") {
+void switchRelay(bool state, const String& source = "") {
   if (state && isEmergencyLocked()) {
     unsigned long elapsed = millis() - lockoutStartTime;
     unsigned long remaining = (elapsed < LOCKOUT_DURATION) ? (LOCKOUT_DURATION - elapsed) : 0;
     int minutes = (remaining + 59999) / 60000;
-    sendMsg("🔒 Аварийная блокировка активна!\n"
-                    "⏱ Осталось: ~" + String(minutes) + " мин\n"
-                    "🔄 Или перезагрузите устройство (/reboot).",
-                    TELEGRAM_CHAT_ID);
+    sendTG("🔒 Аварийная блокировка активна!\n⏱ Осталось: ~" + String(minutes) + " мин\n🔄 Или перезагрузите устройство (/reboot).", CHAT_ID);
     return;
   }
 
   relayState = state;
-  maintenanceMode = (source == "Maintenance");
   digitalWrite(RELAY_PIN, state ? LOW : HIGH);
-  if (state) {
-    lastOnTime = millis();
-    lastAnyActivation = millis();
-  } else {
-    maintenanceMode = false; // сброс при выключении
-  }
+  if (state) lastOnTime = millis();
+  
   saveRelayState();
 
   String msg = state ? "🔥 Котёл включён" : "❄️ Котёл выключен";
   if (source.length()) msg += " (" + source + ")";
-  sendMsg(msg, TELEGRAM_CHAT_ID);
+  sendTG(msg, CHAT_ID);
 }
+
 // ---------- Web ----------
 void handleRoot() {
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<meta charset='UTF-8'><title>Умный котёл</title></head><body>";
-  html += "<h1>Умный котёл</h1>";
-  html += "<p>Состояние: <b>" + String(relayState ? "ВКЛЮЧЕН" : "ВЫКЛЮЧЕН") + "</b></p>";
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Умный котёл</title></head><body>";
+  html += "<h1>Умный котёл</h1><p>Состояние: <b>" + String(relayState ? "ВКЛЮЧЕН" : "ВЫКЛЮЧЕН") + "</b></p>";
   html += "<a href=\"/on\"><button>ВКЛ</button></a> ";
   html += "<a href=\"/off\"><button>ВЫКЛ</button></a> ";
-  html += "<a href=\"/status\"><button>СТАТУС</button></a>";
-  html += "</body></html>";
+  html += "<a href=\"/status\"><button>СТАТУС</button></a></body></html>";
   server.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -189,10 +239,8 @@ void safetyCheck() {
   if (!isEmergencyLocked() && relayState && millis() - lastOnTime > AUTO_OFF_TIME) {
     switchRelay(false, "EMERGENCY");
     emergencyLockout = true;
-    lockoutStartTime = millis(); // запоминаем момент срабатывания
-    sendMsg("🚨 АВАРИЯ: котёл работал слишком долго!\n"
-                    "🔒 Включение заблокировано на 1 час или до перезагрузки.",
-                    TELEGRAM_CHAT_ID);
+    lockoutStartTime = millis();
+    sendTG("🚨 АВАРИЯ: котёл работал слишком долго!\n🔒 Включение заблокировано на 1 час или до перезагрузки.", CHAT_ID);
   }
 }
 
@@ -201,149 +249,127 @@ void setup() {
   Serial.begin(115200);
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);
-
+  
   EEPROM.begin(EEPROM_SIZE);
-
   String ssid, password;
   if (!loadWiFiData(ssid, password)) {
     ssid = DEFAULT_SSID;
     password = DEFAULT_PASSWORD;
-    Serial.println("⚠️ Wi-Fi данные отсутствуют. Используем дефолтные.");
-  } else {
-    Serial.println("✅ Загружены сохранённые Wi-Fi данные: " + ssid);
   }
+  EEPROM.end();
 
-  // Статический IP
   IPAddress local_IP(192, 168, 31, 200);
   IPAddress gateway(192, 168, 31, 1);
   IPAddress subnet(255, 255, 255, 0);
-  IPAddress dns(8, 8, 8, 8); // ← DNS = ваш роутер (часто совпадает с gateway)
+  IPAddress dns(8, 8, 8, 8);
+  
   WiFi.mode(WIFI_STA);
-WiFi.setAutoReconnect(true);
-WiFi.persistent(true);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
 
-currentSSID = ssid;
-currentPASS = password;
-
-// Если хочешь — временно закомментируй для проверки
-WiFi.config(local_IP, gateway, subnet, dns);
-WiFi.hostname("ESP_kotel");
-WiFi.begin(currentSSID.c_str(), currentPASS.c_str());
-
-Serial.println("📡 Wi-Fi: попытка подключения запущена");
-
-
+  currentSSID = ssid;
+  currentPASS = password;
+  WiFi.config(local_IP, gateway, subnet, dns);
+  WiFi.hostname("ESP_kotel");
+  WiFi.begin(currentSSID.c_str(), currentPASS.c_str());
+  
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(500); yield();
+  }
+  
   loadRelayData();
-
+  bot.setOffset(relayData.lastMsgID);
+  bot.setChatID(CHAT_ID);
+  bot.setBufferSizes(2048, 2048);
+  
   server.on("/", handleRoot);
   server.on("/on", handleOn);
   server.on("/off", handleOff);
   server.on("/status", handleStatus);
   server.begin();
+
   bot.attach([](FB_msg& msg) {
-  // --- 1. Проверка дубликатов ---
- if (relayData.lastMsgID > 0 && msg.messageID <= relayData.lastMsgID) {
-    return;
-  }
-  relayData.lastMsgID = msg.messageID;
-  saveMsgID();
+    // Защита от дубликатов по update_id (так как мы сохраняем его)
+if (relayData.lastMsgID > 0 && msg.update_id + 1 <= relayData.lastMsgID) return;
+relayData.lastMsgID = msg.update_id + 1;
+    saveMsgID();
 
+    String cmd = msg.text;
+    cmd.toLowerCase();
 
-  // --- 2. Сохраняем ID сообщения ---
-  relayData.lastMsgID = msg.messageID;
-  saveMsgID(); // ← ЭТО ФУНКЦИЯ ИЗ ТВОЕГО КОДА — она останется!
-
-  // --- 3. Обработка команд ---
-  String cmd = msg.text;
-  cmd.toLowerCase();
-
-  if (cmd == "/on") {
-    switchRelay(true, "Telegram");
-  }
-  else if (cmd == "/off") {
-    switchRelay(false, "Telegram");
-  }
-  else if (cmd == "/status") {
-    String status = "🔧 Статус котла:\n";
-    status += "📌 IP: " + WiFi.localIP().toString() + "\n";
-    status += "📶 WiFi: " + WiFi.SSID() + "\n";
-    status += "📡 RSSI: " + String(WiFi.RSSI()) + " dBm\n";
-    status += "🔌 Реле: " + String(relayState ? "ВКЛ" : "ВЫКЛ") + "\n";
-    status += "🛠 Maintenance: " + String(CHECK_INTERVAL / 60000) + " мин\n";
-    if (relayState) status += "⏱ Время работы: " + String((millis() - lastOnTime) / 1000) + " сек";
-    sendMsg(status, TELEGRAM_CHAT_ID);
-  }
-    else if (cmd == "/reboot") {
-    sendMsg("🔄 Перезагрузка...", TELEGRAM_CHAT_ID);
-    relayData.lastMsgID = msg.messageID;  // ← добавить
-    EEPROM.put(sizeof(WiFiData), relayData); // ← добавить
-    EEPROM.commit();                      // ← добавить
-    delay(100);
-    yield();
-    ESP.restart();
-  }
-  else if (cmd.startsWith("/setwifi ")) {
-    int sp = msg.text.indexOf(' ', 9);
-    if (sp != -1) {
-      String newSSID = msg.text.substring(9, sp);
-      String newPASS = msg.text.substring(sp + 1);
-      if (newSSID.length() < 1 || newPASS.length() < 1) {
-        sendMsg("⚠️ Неверный формат SSID/PASSWORD", TELEGRAM_CHAT_ID);
-        return;
-      }
-      sendMsg("⏳ Подключение к " + newSSID + "...", TELEGRAM_CHAT_ID);
-      WiFi.begin(newSSID.c_str(), newPASS.c_str());
-      bool connected = false;
-      for (int i = 0; i < 10; i++) {
-        if (WiFi.status() == WL_CONNECTED) {
-          connected = true;
-          break;
-        }
-        delay(1000);
-      }
-      if (connected) {
-        currentSSID = newSSID;
-        currentPASS = newPASS;
-        saveWiFiData(newSSID.c_str(), newPASS.c_str());
-        sendMsg("✅ Успешно!\nSSID: " + newSSID + "\nПерезагрузка...", TELEGRAM_CHAT_ID);
-        delay(2000);
-        ESP.restart();
-      } else {
-        sendMsg("❌ Не удалось подключиться. Проверь SSID и пароль.", TELEGRAM_CHAT_ID);
-      }
-    } else {
-      sendMsg("⚠️ Используй: /setwifi SSID PASSWORD", TELEGRAM_CHAT_ID);
+    if (cmd == "/on") {
+      switchRelay(true, "Telegram");
     }
-  }
-  else if (cmd == "/resetmsg") {
-  relayData.lastMsgID = 0;
-  EEPROM.put(sizeof(WiFiData), relayData);
-  EEPROM.commit();
-  sendMsg("♻️ lastMsgID сброшен", TELEGRAM_CHAT_ID);
-}
-else if (cmd.startsWith("/setmaint ")) {
-  unsigned long minutes = cmd.substring(10).toInt();
-  if (minutes < 10 || minutes > 1000) { // 10 мин – 7 суток
-    sendMsg("⚠️ Интервал от 10 до 1000 минут", TELEGRAM_CHAT_ID);
-    return;
-  }
-  CHECK_INTERVAL = minutes * 60UL * 1000UL;
-  saveRelayState();
-  sendMsg("🔧 Профилактическое включение каждые " +
-                  String(minutes) + " мин", TELEGRAM_CHAT_ID);
-}
-  else {
-    // Неизвестная команда
-    sendMsg("❓ Неизвестная команда. Используй /on, /off, /status, /reboot, /setwifi, /resetmsg, /setmaint", TELEGRAM_CHAT_ID);
-  }
-});
-sendMsg("🤖 Устройство онлайн!\nIP: " + WiFi.localIP().toString() +
-                  "\nСостояние: " + String(relayState ? "ВКЛ" : "ВЫКЛ"), "-1001819803857");
+    else if (cmd == "/resetid") {
+        relayData.lastMsgID = 0;
+        saveMsgID();
+        sendTG("♻️ ID сброшен. Жду команды.", CHAT_ID);
+    }
+    else if (cmd == "/off") {
+      switchRelay(false, "Telegram");
+    }
+    else if (cmd == "/status") {
+      String status = "🔧 Статус котла:\n";
+      status += "📌 IP: " + WiFi.localIP().toString() + "\n";
+      status += "📶 WiFi: " + WiFi.SSID() + "\n";
+      status += "📡 RSSI: " + String(WiFi.RSSI()) + " dBm\n";
+      status += "🔌 Реле: " + String(relayState ? "ВКЛ" : "ВЫКЛ") + "\n";
+      if (relayState) status += "⏱ Время работы: " + String((millis() - lastOnTime) / 1000) + " сек";
+      sendTG(status, CHAT_ID);
+    }
+    else if (cmd == "/reboot") {
+      sendTG("🔄 Перезагрузка...", CHAT_ID);
+      relayData.lastMsgID = msg.messageID;
+      saveMsgID();
+      delay(500); yield();
+      ESP.restart();
+    }
+    else if (cmd.startsWith("/setwifi ")) {
+      int sp = msg.text.indexOf(' ', 9);
+      if (sp != -1) {
+        String newSSID = msg.text.substring(9, sp);
+        String newPASS = msg.text.substring(sp + 1);
+        if (newSSID.length() < 1 || newPASS.length() < 1) {
+          sendTG("⚠️ Неверный формат SSID/PASSWORD", CHAT_ID);
+          return;
+        }
+        sendTG("⏳ Подключение к " + newSSID + "...", CHAT_ID);
+        WiFi.begin(newSSID.c_str(), newPASS.c_str());
+        bool connected = false;
+        for (int i = 0; i < 15; i++) {
+          if (WiFi.status() == WL_CONNECTED) { connected = true; break; }
+          delay(1000); yield();
+        }
+        if (connected) {
+          currentSSID = newSSID;
+          currentPASS = newPASS;
+          saveWiFiData(newSSID.c_str(), newPASS.c_str());
+          sendTG("✅ Успешно!\nSSID: " + newSSID + "\nПерезагрузка...", CHAT_ID);
+          delay(2000);
+          ESP.restart();
+        } else {
+          sendTG("❌ Не удалось подключиться. Проверь данные.", CHAT_ID);
+        }
+      } else {
+        sendTG("⚠️ Используй: /setwifi SSID PASSWORD", CHAT_ID);
+      }
+    }
+    else if (cmd == "/resetmsg") {
+      relayData.lastMsgID = 0;
+      saveMsgID();
+      sendTG("♻️ lastMsgID сброшен", CHAT_ID);
+    }
+    else {
+      sendTG("❓ Неизвестная команда. /on, /off, /status, /reboot, /setwifi", CHAT_ID);
+    }
+  });
+
+  // Стартовое сообщение (в группу)
+  sendTG("🤖 Устройство онлайн!\nIP: " + WiFi.localIP().toString() + "\nСостояние: " + String(relayState ? "ВКЛ" : "ВЫКЛ"), "-1001819803857");
+
   ArduinoOTA.setHostname("ESP_tag_kot");
   ArduinoOTA.setPassword("12345678");
-  ArduinoOTA.onStart([]() { Serial.println("📡 Начало OTA обновления..."); });
-  ArduinoOTA.onEnd([]() { Serial.println("\n✅ OTA обновление завершено"); });
-  ArduinoOTA.onError([](ota_error_t error) { Serial.printf("❌ OTA ошибка [%u]\n", error); });
   ArduinoOTA.begin();
 }
 
@@ -354,29 +380,14 @@ void loop() {
   safetyCheck();
   ArduinoOTA.handle();
 
-  // Если Wi‑Fi нет — переподключаемся, но без блокировки loop
   static unsigned long lastReconnect = 0;
-
-if (WiFi.status() != WL_CONNECTED && millis() - lastReconnect > 30000) {
-  Serial.println("🔄 Wi-Fi не подключен. Переподключаемся...");
-
-  WiFi.disconnect(true);
-  delay(100);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(currentSSID.c_str(), currentPASS.c_str());
-
-  lastReconnect = millis();
-}
-
-    // --- Профилактическое включение: если 8 часов не включался — включить на 3 минуты ---
-  if (!relayState && !isEmergencyLocked()) {
-    if (millis() - lastAnyActivation >= CHECK_INTERVAL) {
-      switchRelay(true, "Maintenance");
-    }
+  if (WiFi.status() != WL_CONNECTED && millis() - lastReconnect > 30000) {
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(currentSSID.c_str(), currentPASS.c_str());
+    lastReconnect = millis();
+    yield();
   }
-
-  // --- Авто-выключение после 3 минут в режиме техобслуживания ---
-  if (maintenanceMode && relayState && millis() - lastOnTime >= MAINTENANCE_DURATION) {
-    switchRelay(false, "Maintenance Auto-Off");
-  }
+  yield();
 }
